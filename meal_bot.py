@@ -979,7 +979,7 @@ def main():
     
     # توکن ربات را اینجا قرار دهید
     #TOKEN = 8064665804:AAHgqfBK8lXCA036yNXjnLcmgeQM4T7K3Z8
-    TOKEN = os.getenv('BOT_TOKEN', 8064665804:AAHgqfBK8lXCA036yNXjnLcmgeQM4T7K3Z8)
+    TOKEN = os.getenv("BOT_TOKEN")
     application = Application.builder().token(TOKEN).build()
     
     # Handler ورود
