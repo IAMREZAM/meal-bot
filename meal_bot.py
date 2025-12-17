@@ -97,6 +97,9 @@ def create_excel():
     for col in range(2, ws.max_column + 1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 15
     
+    # Add admin user to Excel by default
+    ws.cell(row=3, column=1, value="مدیر سیستم")
+    
     wb.save(EXCEL_FILE)
     protect_excel()
 
@@ -228,8 +231,9 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [KeyboardButton("➕ افزودن کاربر"), KeyboardButton("👥 لیست کاربران")],
             [KeyboardButton("🍽️ مدیریت منوی غذایی"), KeyboardButton("✏️ ویرایش غذای کاربران")],
-            [KeyboardButton("👁️ مشاهده برنامه"), KeyboardButton("📋 گزارش تغییرات")],
-            [KeyboardButton("🔑 تغییر رمز عبور"), KeyboardButton("🚪 خروج")]
+            [KeyboardButton("🍽️ انتخاب غذاهای من"), KeyboardButton("👁️ مشاهده برنامه")],
+            [KeyboardButton("📋 گزارش تغییرات"), KeyboardButton("🔑 تغییر رمز عبور")],
+            [KeyboardButton("🚪 خروج")]
         ]
     else:
         keyboard = [
@@ -255,24 +259,36 @@ async def view_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wb = openpyxl.load_workbook(EXCEL_FILE)
         ws = wb.active
         
-        message = "📅 *برنامه غذایی*\n\n"
+        # Send Excel file directly
+        await update.message.reply_document(
+            document=open(EXCEL_FILE, 'rb'),
+            filename="meal_plan.xlsx",
+            caption="📅 *برنامه غذایی*\n\nفایل اکسل برنامه غذایی را دانلود کنید.",
+            parse_mode='Markdown'
+        )
         
-        # خواندن هدرها و داده‌ها
-        for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=min(ws.max_row, 12)), 1):
-            line = []
-            for cell in row:
-                value = str(cell.value if cell.value else "-")
-                line.append(value[:15])
-            
-            if row_idx <= 2:
-                message += "`" + " | ".join(line) + "`\n"
-                if row_idx == 2:
-                    message += "─" * 50 + "\n"
-            else:
-                message += " | ".join(line) + "\n"
+        # Also send a text summary
+        message = "📊 *خلاصه برنامه غذایی*\n\n"
         
-        if ws.max_row > 12:
-            message += f"\n... و {ws.max_row - 12} سطر دیگر"
+        # Count users
+        user_count = 0
+        for row in range(3, ws.max_row + 1):
+            if ws.cell(row=row, column=1).value:
+                user_count += 1
+        
+        message += f"👥 تعداد افراد: {user_count}\n"
+        message += f"📅 تعداد هفته‌ها: 4\n"
+        message += f"📆 تعداد روزها: 20 (5 روز × 4 هفته)\n\n"
+        
+        # List users
+        message += "👤 *افراد ثبت شده:*\n"
+        for row in range(3, min(ws.max_row + 1, 13)):
+            name = ws.cell(row=row, column=1).value
+            if name:
+                message += f"  • {name}\n"
+        
+        if user_count > 10:
+            message += f"  ... و {user_count - 10} نفر دیگر\n"
         
         await update.message.reply_text(message, parse_mode='Markdown')
         
@@ -718,8 +734,11 @@ async def edit_user_select_day(update: Update, context: ContextTypes.DEFAULT_TYP
         users = json.load(f)
     full_name = users[username]['full_name']
     
-    wb = openpyxl.load_workbook(EXCEL_FILE)
-    ws = wb.active
+    wb, ws = unprotect_excel()
+    if not wb or not ws:
+        await query.answer("❌ خطا در باز کردن فایل!", show_alert=True)
+        protect_excel()
+        return EDIT_USER_DAY
     
     user_row = None
     for row in range(3, ws.max_row + 2):
@@ -727,9 +746,11 @@ async def edit_user_select_day(update: Update, context: ContextTypes.DEFAULT_TYP
             user_row = row
             break
     
+    # If user not found in Excel, add them
     if not user_row:
-        await query.answer("❌ کاربر در اکسل یافت نشد!", show_alert=True)
-        return EDIT_USER_DAY
+        user_row = ws.max_row + 1
+        ws.cell(row=user_row, column=1, value=full_name)
+        wb.save(EXCEL_FILE)
     
     # محاسبه ستون
     day_idx = int(day) - 1
@@ -738,6 +759,9 @@ async def edit_user_select_day(update: Update, context: ContextTypes.DEFAULT_TYP
     
     current_meal = ws.cell(row=user_row, column=col).value or "-"
     current_dessert = ws.cell(row=user_row, column=col+1).value or "-"
+    
+    # Lock Excel back
+    protect_excel()
     
     days_name = {1: "شنبه", 2: "یکشنبه", 3: "دوشنبه", 4: "سه‌شنبه", 5: "چهارشنبه"}
     
@@ -944,7 +968,23 @@ async def change_password_confirm(update: Update, context: ContextTypes.DEFAULT_
     context.user_data.clear()
     return ConversationHandler.END
 
-async def view_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def download_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دانلود فایل اکسل (فقط ادمین)"""
+    telegram_id = update.effective_user.id
+    if telegram_id not in user_sessions or not user_sessions[telegram_id]['is_admin']:
+        await update.message.reply_text("⛔ شما دسترسی ندارید!")
+        return
+    
+    try:
+        with open(EXCEL_FILE, 'rb') as f:
+            await update.message.reply_document(
+                document=f,
+                filename="meal_plan.xlsx",
+                caption="📥 *فایل اکسل برنامه غذایی*\n\nفایل قفل شده است.",
+                parse_mode='Markdown'
+            )
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا: {str(e)}")
     """مشاهده گزارش تغییرات"""
     telegram_id = update.effective_user.id
     if telegram_id not in user_sessions or not user_sessions[telegram_id]['is_admin']:
@@ -1063,9 +1103,13 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^✏️ ویرایش غذای کاربران$"), edit_user_meals_start)],
         states={
             EDIT_USER_SELECT: [CallbackQueryHandler(edit_user_select_user, pattern="^edituser_")],
-            EDIT_USER_WEEK: [CallbackQueryHandler(edit_user_select_week, pattern="^edituser_week_")],
+            EDIT_USER_WEEK: [
+                CallbackQueryHandler(edit_user_select_week, pattern="^edituser_week_"),
+                CallbackQueryHandler(lambda u, c: ConversationHandler.END, pattern="^edituser_cancel$")
+            ],
             EDIT_USER_DAY: [
                 CallbackQueryHandler(edit_user_select_day, pattern="^edituser_day_"),
+                CallbackQueryHandler(edit_user_select_week, pattern="^edituser_week_"),  # Back button
                 CallbackQueryHandler(set_user_meal_dessert, pattern="^(setmeal|setdessert)_"),
                 CallbackQueryHandler(lambda u, c: ConversationHandler.END, pattern="^edituser_done$"),
             ],
@@ -1080,9 +1124,13 @@ def main():
     my_meals_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🍽️ انتخاب غذاهای من$"), my_meals_start)],
         states={
-            EDIT_USER_WEEK: [CallbackQueryHandler(edit_user_select_week, pattern="^edituser_week_")],
+            EDIT_USER_WEEK: [
+                CallbackQueryHandler(edit_user_select_week, pattern="^edituser_week_"),
+                CallbackQueryHandler(lambda u, c: ConversationHandler.END, pattern="^edituser_cancel$")
+            ],
             EDIT_USER_DAY: [
                 CallbackQueryHandler(edit_user_select_day, pattern="^edituser_day_"),
+                CallbackQueryHandler(edit_user_select_week, pattern="^edituser_week_"),  # Back button
                 CallbackQueryHandler(set_user_meal_dessert, pattern="^(setmeal|setdessert)_"),
                 CallbackQueryHandler(lambda u, c: ConversationHandler.END, pattern="^edituser_done$"),
             ],
@@ -1106,6 +1154,7 @@ def main():
     
     # اضافه کردن handlers
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("download", download_excel))
     application.add_handler(login_handler)
     application.add_handler(add_user_handler)
     application.add_handler(menu_handler)
