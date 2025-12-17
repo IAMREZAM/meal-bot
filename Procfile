@@ -1,0 +1,1 @@
+worker: python meal_bot.py
