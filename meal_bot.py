@@ -652,6 +652,11 @@ async def edit_user_select_week(update: Update, context: ContextTypes.DEFAULT_TY
     week = query.data.split('_')[2]
     context.user_data['edit_week'] = week
     
+    # Ensure username is set (for regular users editing their own meals)
+    telegram_id = update.effective_user.id
+    if telegram_id in user_sessions and 'edit_username' not in context.user_data:
+        context.user_data['edit_username'] = user_sessions[telegram_id]['username']
+    
     keyboard = [
         [InlineKeyboardButton("شنبه", callback_data="edituser_day_1")],
         [InlineKeyboardButton("یکشنبه", callback_data="edituser_day_2")],
@@ -679,8 +684,22 @@ async def edit_user_select_day(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
     
     day = query.data.split('_')[2]
-    week = context.user_data['edit_week']
-    username = context.user_data['edit_username']
+    week = context.user_data.get('edit_week')
+    username = context.user_data.get('edit_username')
+    
+    # Safety check: Ensure username exists
+    telegram_id = update.effective_user.id
+    if not username and telegram_id in user_sessions:
+        username = user_sessions[telegram_id]['username']
+        context.user_data['edit_username'] = username
+    
+    if not username:
+        await query.answer("❌ خطا: نام کاربری یافت نشد. لطفاً دوباره وارد شوید.", show_alert=True)
+        return ConversationHandler.END
+    
+    if not week:
+        await query.answer("❌ خطا: هفته انتخاب نشده است.", show_alert=True)
+        return ConversationHandler.END
     
     context.user_data['edit_day'] = day
     
@@ -769,7 +788,17 @@ async def set_user_meal_dessert(update: Update, context: ContextTypes.DEFAULT_TY
     day = parts[2]
     item_value = '_'.join(parts[3:])
     
-    username = context.user_data['edit_username']
+    username = context.user_data.get('edit_username')
+    
+    # Safety check: Ensure username exists
+    telegram_id = update.effective_user.id
+    if not username and telegram_id in user_sessions:
+        username = user_sessions[telegram_id]['username']
+        context.user_data['edit_username'] = username
+    
+    if not username:
+        await query.answer("❌ خطا: نام کاربری یافت نشد. لطفاً دوباره وارد شوید.", show_alert=True)
+        return ConversationHandler.END
     
     with open(USERS_FILE, 'r', encoding='utf-8') as f:
         users = json.load(f)
@@ -800,8 +829,14 @@ async def set_user_meal_dessert(update: Update, context: ContextTypes.DEFAULT_TY
     protect_excel()
     
     # ثبت در لاگ
-    admin_name = user_sessions[update.effective_user.id]['full_name']
-    log_change(f"{admin_name} (ویرایش برای {full_name})")
+    if telegram_id in user_sessions:
+        if user_sessions[telegram_id]['is_admin']:
+            admin_name = user_sessions[telegram_id]['full_name']
+            log_change(f"{admin_name} (ویرایش برای {full_name})")
+        else:
+            log_change(full_name)
+    else:
+        log_change(full_name)
     
     await query.answer(f"✅ {'غذا' if item_type == 'setmeal' else 'دسر'} ذخیره شد!", show_alert=True)
     
