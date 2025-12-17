@@ -818,12 +818,15 @@ async def my_meals_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ لطفاً ابتدا وارد شوید!")
         return ConversationHandler.END
     
+    # IMPORTANT: Set username for editing
+    context.user_data['edit_username'] = user_sessions[telegram_id]['username']
+    
     keyboard = [
-        [InlineKeyboardButton("هفته 1", callback_data="mymeals_week_1")],
-        [InlineKeyboardButton("هفته 2", callback_data="mymeals_week_2")],
-        [InlineKeyboardButton("هفته 3", callback_data="mymeals_week_3")],
-        [InlineKeyboardButton("هفته 4", callback_data="mymeals_week_4")],
-        [InlineKeyboardButton("❌ انصراف", callback_data="mymeals_cancel")]
+        [InlineKeyboardButton("هفته 1", callback_data="edituser_week_1")],
+        [InlineKeyboardButton("هفته 2", callback_data="edituser_week_2")],
+        [InlineKeyboardButton("هفته 3", callback_data="edituser_week_3")],
+        [InlineKeyboardButton("هفته 4", callback_data="edituser_week_4")],
+        [InlineKeyboardButton("❌ انصراف", callback_data="edituser_cancel")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -962,7 +965,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "✏️ ویرایش غذای کاربران":
         return await edit_user_meals_start(update, context)
     elif text == "🍽️ انتخاب غذاهای من":
-        context.user_data['edit_username'] = user_sessions[update.effective_user.id]['username']
         return await my_meals_start(update, context)
     elif text == "📋 گزارش تغییرات":
         return await view_log(update, context)
@@ -978,8 +980,8 @@ def main():
     initialize_files()
     
     # توکن ربات را اینجا قرار دهید
-    #TOKEN = 8064665804:AAHgqfBK8lXCA036yNXjnLcmgeQM4T7K3Z8
-    TOKEN = os.getenv("BOT_TOKEN")
+    TOKEN = "YOUR_BOT_TOKEN_HERE"
+    
     application = Application.builder().token(TOKEN).build()
     
     # Handler ورود
@@ -1043,7 +1045,7 @@ def main():
     my_meals_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🍽️ انتخاب غذاهای من$"), my_meals_start)],
         states={
-            EDIT_USER_WEEK: [CallbackQueryHandler(edit_user_select_week, pattern="^mymeals_week_")],
+            EDIT_USER_WEEK: [CallbackQueryHandler(edit_user_select_week, pattern="^edituser_week_")],
             EDIT_USER_DAY: [
                 CallbackQueryHandler(edit_user_select_day, pattern="^edituser_day_"),
                 CallbackQueryHandler(set_user_meal_dessert, pattern="^(setmeal|setdessert)_"),
@@ -1052,7 +1054,7 @@ def main():
         },
         fallbacks=[
             CommandHandler('cancel', cancel),
-            CallbackQueryHandler(lambda u, c: ConversationHandler.END, pattern="^mymeals_cancel$")
+            CallbackQueryHandler(lambda u, c: ConversationHandler.END, pattern="^edituser_cancel$")
         ],
     )
     
