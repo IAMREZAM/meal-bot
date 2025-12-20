@@ -1,1172 +1,860 @@
-import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ConversationHandler, filters, ContextTypes
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Protection
-import json
-import hashlib
 import os
-from datetime import datetime
+import logging
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters
+)
+import sqlite3
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill
+import json
 
 # تنظیمات لاگ
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# فایل‌ها
-EXCEL_FILE = "meal_plan.xlsx"
-USERS_FILE = "users.json"
-LOG_FILE = "change_log.txt"
-MENU_FILE = "daily_menus.json"
-EXCEL_PASSWORD = "MealPlanner2024!@#"
+# آیدی ادمین - اینجا را تغییر دهید
+ADMIN_ID = 166152961  # آیدی عددی تلگرام ادمین
 
 # States برای ConversationHandler
-(LOGIN_USERNAME, LOGIN_PASSWORD, ADD_USER_USERNAME, ADD_USER_FULLNAME, 
- ADD_USER_PASSWORD, CHANGE_PASSWORD_CURRENT, CHANGE_PASSWORD_NEW, 
- CHANGE_PASSWORD_CONFIRM, SELECT_WEEK, SELECT_DAY, EDIT_USER_SELECT,
- EDIT_USER_WEEK, EDIT_USER_DAY) = range(13)
+(ADD_MEAL, ADD_DESSERT, ADD_USER_ID, ADD_USER_NAME, 
+ SELECT_DAY_MEAL, SELECT_DAY_DESSERT, BROADCAST_MSG) = range(7)
 
-# ذخیره وضعیت کاربران
-user_sessions = {}
-
-def hash_password(password):
-    """رمزنگاری رمز عبور"""
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def initialize_files():
-    """ایجاد فایل‌های اولیه"""
-    if not os.path.exists(USERS_FILE):
-        default_users = {
-            "admin": {
-                "password": hash_password("admin123"),
-                "is_admin": True,
-                "full_name": "مدیر سیستم",
-                "telegram_id": None
-            }
-        }
-        with open(USERS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(default_users, f, ensure_ascii=False, indent=2)
+# Database initialization
+def init_db():
+    conn = sqlite3.connect('food_reservation.db')
+    c = conn.cursor()
     
-    if not os.path.exists(MENU_FILE):
-        default_menu = {
-            f"week_{w+1}": {
-                f"day_{d+1}": {"meals": [], "desserts": []}
-                for d in range(5)
-            }
-            for w in range(4)
-        }
-        with open(MENU_FILE, 'w', encoding='utf-8') as f:
-            json.dump(default_menu, f, ensure_ascii=False, indent=2)
+    # جدول کاربران
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (user_id INTEGER PRIMARY KEY,
+                  first_name TEXT NOT NULL,
+                  last_name TEXT NOT NULL,
+                  is_active INTEGER DEFAULT 1,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     
-    if not os.path.exists(LOG_FILE):
-        with open(LOG_FILE, 'w', encoding='utf-8') as f:
-            f.write("=== گزارش تغییرات برنامه غذایی ===\n")
-            f.write(f"تاریخ ایجاد: {datetime.now().strftime('%Y/%m/%d - %H:%M:%S')}\n")
-            f.write("="*50 + "\n\n")
+    # جدول غذاها
+    c.execute('''CREATE TABLE IF NOT EXISTS meals
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  name TEXT NOT NULL,
+                  type TEXT NOT NULL,
+                  day_of_week INTEGER NOT NULL,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     
-    if not os.path.exists(EXCEL_FILE):
-        create_excel()
+    # جدول رزروها
+    c.execute('''CREATE TABLE IF NOT EXISTS reservations
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER NOT NULL,
+                  meal_id INTEGER,
+                  dessert_id INTEGER,
+                  reservation_date DATE NOT NULL,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  FOREIGN KEY (user_id) REFERENCES users (user_id),
+                  FOREIGN KEY (meal_id) REFERENCES meals (id),
+                  FOREIGN KEY (dessert_id) REFERENCES meals (id),
+                  UNIQUE(user_id, reservation_date))''')
+    
+    # جدول تنظیمات
+    c.execute('''CREATE TABLE IF NOT EXISTS settings
+                 (key TEXT PRIMARY KEY,
+                  value TEXT NOT NULL)''')
+    
+    conn.commit()
+    conn.close()
 
-def create_excel():
-    """ایجاد فایل اکسل"""
-    wb = openpyxl.Workbook()
+# تابع کمکی برای بررسی ادمین بودن
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+# تابع کمکی برای بررسی کاربر مجاز
+def is_authorized_user(user_id: int) -> bool:
+    conn = sqlite3.connect('food_reservation.db')
+    c = conn.cursor()
+    c.execute("SELECT is_active FROM users WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+    return result is not None and result[0] == 1
+
+# دستور start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if is_admin(user.id):
+        keyboard = [
+            [InlineKeyboardButton("👥 مدیریت کاربران", callback_data='admin_users')],
+            [InlineKeyboardButton("🍽 مدیریت غذاها", callback_data='admin_meals')],
+            [InlineKeyboardButton("📊 مشاهده رزروها", callback_data='admin_view_reservations')],
+            [InlineKeyboardButton("📥 دریافت فایل اکسل", callback_data='admin_export_excel')],
+            [InlineKeyboardButton("📢 ارسال پیام همگانی", callback_data='admin_broadcast')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"سلام ادمین عزیز {user.first_name}!\n\n"
+            "به پنل مدیریت ربات رزرو غذا خوش آمدید.",
+            reply_markup=reply_markup
+        )
+    elif is_authorized_user(user.id):
+        keyboard = [
+            [InlineKeyboardButton("🍽 رزرو غذا", callback_data='reserve_food')],
+            [InlineKeyboardButton("📋 رزروهای من", callback_data='my_reservations')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"سلام {user.first_name}!\n\n"
+            "به ربات رزرو غذا خوش آمدید.",
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text(
+            "متأسفانه شما دسترسی به این ربات ندارید.\n"
+            "لطفاً با مدیر سیستم تماس بگیرید."
+        )
+
+# منوی اصلی ادمین
+async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("👥 مدیریت کاربران", callback_data='admin_users')],
+        [InlineKeyboardButton("🍽 مدیریت غذاها", callback_data='admin_meals')],
+        [InlineKeyboardButton("📊 مشاهده رزروها", callback_data='admin_view_reservations')],
+        [InlineKeyboardButton("📥 دریافت فایل اکسل", callback_data='admin_export_excel')],
+        [InlineKeyboardButton("📢 ارسال پیام همگانی", callback_data='admin_broadcast')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "پنل مدیریت ربات رزرو غذا:",
+        reply_markup=reply_markup
+    )
+
+# مدیریت کاربران
+async def admin_users_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ افزودن کاربر", callback_data='add_user')],
+        [InlineKeyboardButton("📋 لیست کاربران", callback_data='list_users')],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data='back_to_admin')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "مدیریت کاربران:",
+        reply_markup=reply_markup
+    )
+
+# شروع افزودن کاربر
+async def start_add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text(
+        "لطفاً آیدی عددی کاربر را وارد کنید:\n\n"
+        "برای لغو /cancel را ارسال کنید."
+    )
+    
+    return ADD_USER_ID
+
+# دریافت آیدی کاربر
+async def receive_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = int(update.message.text)
+        context.user_data['new_user_id'] = user_id
+        
+        await update.message.reply_text(
+            "حالا نام و نام خانوادگی کاربر را وارد کنید:\n"
+            "مثال: علی احمدی"
+        )
+        
+        return ADD_USER_NAME
+    except ValueError:
+        await update.message.reply_text(
+            "آیدی باید عدد باشد. دوباره تلاش کنید:"
+        )
+        return ADD_USER_ID
+
+# دریافت نام کاربر
+async def receive_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name_parts = update.message.text.strip().split(' ', 1)
+    
+    if len(name_parts) < 2:
+        await update.message.reply_text(
+            "لطفاً نام و نام خانوادگی را با فاصله وارد کنید:\n"
+            "مثال: علی احمدی"
+        )
+        return ADD_USER_NAME
+    
+    first_name, last_name = name_parts[0], name_parts[1]
+    user_id = context.user_data['new_user_id']
+    
+    conn = sqlite3.connect('food_reservation.db')
+    c = conn.cursor()
+    
+    try:
+        c.execute(
+            "INSERT INTO users (user_id, first_name, last_name) VALUES (?, ?, ?)",
+            (user_id, first_name, last_name)
+        )
+        conn.commit()
+        await update.message.reply_text(
+            f"✅ کاربر {first_name} {last_name} با موفقیت اضافه شد!\n\n"
+            "برای بازگشت به منو /start را ارسال کنید."
+        )
+    except sqlite3.IntegrityError:
+        await update.message.reply_text(
+            "❌ این کاربر قبلاً ثبت شده است.\n\n"
+            "برای بازگشت به منو /start را ارسال کنید."
+        )
+    finally:
+        conn.close()
+    
+    return ConversationHandler.END
+
+# لیست کاربران
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    conn = sqlite3.connect('food_reservation.db')
+    c = conn.cursor()
+    c.execute("SELECT user_id, first_name, last_name, is_active FROM users ORDER BY first_name")
+    users = c.fetchall()
+    conn.close()
+    
+    if not users:
+        text = "هیچ کاربری ثبت نشده است."
+    else:
+        text = "📋 لیست کاربران:\n\n"
+        for user_id, first_name, last_name, is_active in users:
+            status = "✅ فعال" if is_active else "❌ غیرفعال"
+            text += f"• {first_name} {last_name} ({user_id}) - {status}\n"
+    
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data='admin_users')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+# مدیریت غذاها
+async def admin_meals_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ افزودن غذا", callback_data='add_meal')],
+        [InlineKeyboardButton("➕ افزودن دسر", callback_data='add_dessert')],
+        [InlineKeyboardButton("📋 لیست غذاها", callback_data='list_meals')],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data='back_to_admin')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "مدیریت غذاها و دسرها:",
+        reply_markup=reply_markup
+    )
+
+# انتخاب روز برای غذا
+async def select_day_for_meal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['meal_type'] = 'meal'
+    
+    days = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه']
+    keyboard = []
+    for i, day in enumerate(days):
+        keyboard.append([InlineKeyboardButton(day, callback_data=f'day_meal_{i}')])
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data='admin_meals')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(
+        "روز هفته را انتخاب کنید:",
+        reply_markup=reply_markup
+    )
+
+# انتخاب روز برای دسر
+async def select_day_for_dessert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['meal_type'] = 'dessert'
+    
+    days = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه']
+    keyboard = []
+    for i, day in enumerate(days):
+        keyboard.append([InlineKeyboardButton(day, callback_data=f'day_dessert_{i}')])
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data='admin_meals')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(
+        "روز هفته را انتخاب کنید:",
+        reply_markup=reply_markup
+    )
+
+# دریافت نام غذا
+async def receive_meal_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    day = int(query.data.split('_')[-1])
+    meal_type = context.user_data.get('meal_type', 'meal')
+    
+    context.user_data['meal_day'] = day
+    
+    days = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه']
+    meal_type_fa = 'غذا' if meal_type == 'meal' else 'دسر'
+    
+    await query.edit_message_text(
+        f"نام {meal_type_fa} برای روز {days[day]} را وارد کنید:\n\n"
+        "برای لغو /cancel را ارسال کنید."
+    )
+    
+    return ADD_MEAL if meal_type == 'meal' else ADD_DESSERT
+
+# ذخیره غذا یا دسر
+async def save_meal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    meal_name = update.message.text.strip()
+    day = context.user_data['meal_day']
+    meal_type = context.user_data.get('meal_type', 'meal')
+    
+    conn = sqlite3.connect('food_reservation.db')
+    c = conn.cursor()
+    
+    c.execute(
+        "INSERT INTO meals (name, type, day_of_week) VALUES (?, ?, ?)",
+        (meal_name, meal_type, day)
+    )
+    conn.commit()
+    conn.close()
+    
+    days = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه']
+    meal_type_fa = 'غذا' if meal_type == 'meal' else 'دسر'
+    
+    await update.message.reply_text(
+        f"✅ {meal_type_fa} '{meal_name}' برای روز {days[day]} اضافه شد!\n\n"
+        "برای بازگشت به منو /start را ارسال کنید."
+    )
+    
+    return ConversationHandler.END
+
+# لیست غذاها
+async def list_meals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    conn = sqlite3.connect('food_reservation.db')
+    c = conn.cursor()
+    
+    days = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه']
+    text = "📋 لیست غذاها و دسرها:\n\n"
+    
+    for i, day in enumerate(days):
+        text += f"📅 {day}:\n"
+        
+        c.execute("SELECT name FROM meals WHERE day_of_week = ? AND type = 'meal'", (i,))
+        meals = c.fetchall()
+        if meals:
+            text += "  🍽 غذاها: " + ", ".join([m[0] for m in meals]) + "\n"
+        
+        c.execute("SELECT name FROM meals WHERE day_of_week = ? AND type = 'dessert'", (i,))
+        desserts = c.fetchall()
+        if desserts:
+            text += "  🍰 دسرها: " + ", ".join([d[0] for d in desserts]) + "\n"
+        
+        text += "\n"
+    
+    conn.close()
+    
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data='admin_meals')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+# رزرو غذا توسط کاربران
+async def reserve_food_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    # نمایش 14 روز آینده
+    keyboard = []
+    today = datetime.now().date()
+    
+    for i in range(14):
+        date = today + timedelta(days=i)
+        day_name = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه'][date.weekday()]
+        date_str = date.strftime('%Y-%m-%d')
+        button_text = f"{day_name} - {date.strftime('%d/%m')}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f'reserve_{date_str}')])
+    
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data='back_to_main')])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "روز مورد نظر برای رزرو را انتخاب کنید:",
+        reply_markup=reply_markup
+    )
+
+# انتخاب غذا برای رزرو
+async def select_meal_for_reservation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    date_str = query.data.split('_')[1]
+    date = datetime.strptime(date_str, '%Y-%m-%d').date()
+    day_of_week = date.weekday()
+    
+    context.user_data['reservation_date'] = date_str
+    
+    conn = sqlite3.connect('food_reservation.db')
+    c = conn.cursor()
+    c.execute("SELECT id, name FROM meals WHERE day_of_week = ? AND type = 'meal'", (day_of_week,))
+    meals = c.fetchall()
+    conn.close()
+    
+    if not meals:
+        await query.edit_message_text(
+            "❌ برای این روز غذایی تعریف نشده است.\n\n"
+            "برای بازگشت /start را ارسال کنید."
+        )
+        return
+    
+    keyboard = []
+    for meal_id, meal_name in meals:
+        keyboard.append([InlineKeyboardButton(meal_name, callback_data=f'meal_{meal_id}')])
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data='reserve_food')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    day_name = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه'][day_of_week]
+    await query.edit_message_text(
+        f"غذای خود را برای {day_name} انتخاب کنید:",
+        reply_markup=reply_markup
+    )
+
+# انتخاب دسر برای رزرو
+async def select_dessert_for_reservation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    meal_id = int(query.data.split('_')[1])
+    context.user_data['selected_meal_id'] = meal_id
+    
+    date_str = context.user_data['reservation_date']
+    date = datetime.strptime(date_str, '%Y-%m-%d').date()
+    day_of_week = date.weekday()
+    
+    conn = sqlite3.connect('food_reservation.db')
+    c = conn.cursor()
+    c.execute("SELECT id, name FROM meals WHERE day_of_week = ? AND type = 'dessert'", (day_of_week,))
+    desserts = c.fetchall()
+    conn.close()
+    
+    keyboard = []
+    for dessert_id, dessert_name in desserts:
+        keyboard.append([InlineKeyboardButton(dessert_name, callback_data=f'dessert_{dessert_id}')])
+    keyboard.append([InlineKeyboardButton("بدون دسر", callback_data='dessert_none')])
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f'reserve_{date_str}')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "دسر خود را انتخاب کنید:",
+        reply_markup=reply_markup
+    )
+
+# تکمیل رزرو
+async def complete_reservation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    dessert_id = None if query.data == 'dessert_none' else int(query.data.split('_')[1])
+    meal_id = context.user_data['selected_meal_id']
+    date_str = context.user_data['reservation_date']
+    user_id = update.effective_user.id
+    
+    conn = sqlite3.connect('food_reservation.db')
+    c = conn.cursor()
+    
+    try:
+        c.execute(
+            "INSERT OR REPLACE INTO reservations (user_id, meal_id, dessert_id, reservation_date) VALUES (?, ?, ?, ?)",
+            (user_id, meal_id, dessert_id, date_str)
+        )
+        conn.commit()
+        
+        # دریافت نام غذا و دسر
+        c.execute("SELECT name FROM meals WHERE id = ?", (meal_id,))
+        meal_name = c.fetchone()[0]
+        
+        dessert_name = "بدون دسر"
+        if dessert_id:
+            c.execute("SELECT name FROM meals WHERE id = ?", (dessert_id,))
+            dessert_name = c.fetchone()[0]
+        
+        date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        day_name = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه'][date.weekday()]
+        
+        await query.edit_message_text(
+            f"✅ رزرو شما ثبت شد!\n\n"
+            f"📅 روز: {day_name} - {date.strftime('%d/%m/%Y')}\n"
+            f"🍽 غذا: {meal_name}\n"
+            f"🍰 دسر: {dessert_name}\n\n"
+            "برای بازگشت به منو /start را ارسال کنید."
+        )
+    except Exception as e:
+        await query.edit_message_text(
+            f"❌ خطا در ثبت رزرو: {str(e)}\n\n"
+            "برای بازگشت /start را ارسال کنید."
+        )
+    finally:
+        conn.close()
+
+# مشاهده رزروهای کاربر
+async def my_reservations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    
+    conn = sqlite3.connect('food_reservation.db')
+    c = conn.cursor()
+    
+    c.execute('''
+        SELECT r.reservation_date, m1.name, m2.name
+        FROM reservations r
+        LEFT JOIN meals m1 ON r.meal_id = m1.id
+        LEFT JOIN meals m2 ON r.dessert_id = m2.id
+        WHERE r.user_id = ? AND r.reservation_date >= date('now')
+        ORDER BY r.reservation_date
+    ''', (user_id,))
+    
+    reservations = c.fetchall()
+    conn.close()
+    
+    if not reservations:
+        text = "شما هیچ رزروی ندارید."
+    else:
+        text = "📋 رزروهای شما:\n\n"
+        for date_str, meal_name, dessert_name in reservations:
+            date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            day_name = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه'][date.weekday()]
+            dessert_text = dessert_name if dessert_name else "بدون دسر"
+            text += f"📅 {day_name} {date.strftime('%d/%m')}\n"
+            text += f"   🍽 {meal_name}\n"
+            text += f"   🍰 {dessert_text}\n\n"
+    
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data='back_to_main')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+# مشاهده رزروها توسط ادمین
+async def admin_view_reservations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    conn = sqlite3.connect('food_reservation.db')
+    c = conn.cursor()
+    
+    c.execute('''
+        SELECT u.first_name, u.last_name, r.reservation_date, m1.name, m2.name
+        FROM reservations r
+        JOIN users u ON r.user_id = u.user_id
+        LEFT JOIN meals m1 ON r.meal_id = m1.id
+        LEFT JOIN meals m2 ON r.dessert_id = m2.id
+        WHERE r.reservation_date >= date('now')
+        ORDER BY r.reservation_date, u.first_name
+    ''')
+    
+    reservations = c.fetchall()
+    conn.close()
+    
+    if not reservations:
+        text = "هیچ رزروی ثبت نشده است."
+    else:
+        text = "📊 رزروهای ثبت شده:\n\n"
+        current_date = None
+        for first_name, last_name, date_str, meal_name, dessert_name in reservations:
+            date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            
+            if date != current_date:
+                day_name = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه'][date.weekday()]
+                text += f"\n📅 {day_name} {date.strftime('%d/%m/%Y')}:\n"
+                current_date = date
+            
+            dessert_text = dessert_name if dessert_name else "بدون دسر"
+            text += f"• {first_name} {last_name}: {meal_name} + {dessert_text}\n"
+    
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data='back_to_admin')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+# خروجی اکسل
+async def export_to_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("در حال تولید فایل اکسل...")
+    
+    conn = sqlite3.connect('food_reservation.db')
+    c = conn.cursor()
+    
+    # ایجاد Workbook
+    wb = Workbook()
     ws = wb.active
     ws.title = "برنامه غذایی"
-    ws.sheet_view.rightToLeft = True
     
-    ws['A1'] = "نام و نام خانوادگی"
-    days = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه']
-    col = 2
+    # تنظیمات استایل
+    header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    center_alignment = Alignment(horizontal="center", vertical="center")
     
-    for week in range(4):
-        for day in days:
-            ws.cell(row=1, column=col, value=f"{day} - هفته {week+1}")
-            ws.cell(row=2, column=col, value="غذا")
-            ws.cell(row=2, column=col+1, value="دسر")
-            col += 2
+    # سرستون‌ها
+    today = datetime.now().date()
+    headers = ["نام"]
+    dates = []
     
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    header_font = Font(bold=True, color="FFFFFF", size=11)
+    for i in range(14):
+        date = today + timedelta(days=i)
+        day_name = ['شنبه', 'یکشنبه', 'دوشنبه', 'سه‌شنبه', 'چهارشنبه', 'پنجشنبه', 'جمعه'][date.weekday()]
+        headers.append(f"{day_name}\n{date.strftime('%d/%m')}")
+        dates.append(date.strftime('%Y-%m-%d'))
     
-    for row in [1, 2]:
-        for cell in ws[row]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal='center', vertical='center')
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center_alignment
     
-    ws.column_dimensions['A'].width = 25
-    for col in range(2, ws.max_column + 1):
-        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 15
+    # دریافت کاربران
+    c.execute("SELECT user_id, first_name, last_name FROM users WHERE is_active = 1 ORDER BY first_name")
+    users = c.fetchall()
     
-    # Add admin user to Excel by default
-    ws.cell(row=3, column=1, value="مدیر سیستم")
-    
-    wb.save(EXCEL_FILE)
-    protect_excel()
-
-def protect_excel():
-    """قفل کردن اکسل"""
-    try:
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        ws = wb.active
-        for row in ws.iter_rows():
-            for cell in row:
-                cell.protection = Protection(locked=True, hidden=False)
-        ws.protection.sheet = True
-        ws.protection.password = EXCEL_PASSWORD
-        wb.save(EXCEL_FILE)
-    except Exception as e:
-        logger.error(f"خطا در قفل کردن: {e}")
-
-def unprotect_excel():
-    """باز کردن قفل اکسل"""
-    try:
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        ws = wb.active
-        ws.protection.sheet = False
-        ws.protection.password = ''
-        wb.save(EXCEL_FILE)
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        ws = wb.active
-        return wb, ws
-    except Exception as e:
-        logger.error(f"خطا در باز کردن قفل: {e}")
-        return None, None
-
-def log_change(user_fullname):
-    """ثبت در لاگ"""
-    timestamp = datetime.now().strftime('%Y/%m/%d - %H:%M:%S')
-    with open(LOG_FILE, 'a', encoding='utf-8') as f:
-        f.write(f"کاربر: {user_fullname}\n")
-        f.write(f"زمان تغییر: {timestamp}\n")
-        f.write("-"*50 + "\n")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """شروع ربات"""
-    telegram_id = update.effective_user.id
-    
-    # بررسی اگر کاربر لاگین کرده
-    if telegram_id in user_sessions:
-        await show_main_menu(update, context)
-        return
-    
-    keyboard = [
-        [KeyboardButton("🔐 ورود به سیستم")],
-        [KeyboardButton("👁️ مشاهده برنامه غذایی")]
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    await update.message.reply_text(
-        "🍽️ *به سیستم مدیریت برنامه غذایی خوش آمدید*\n\n"
-        "لطفاً یکی از گزینه‌های زیر را انتخاب کنید:",
-        parse_mode='Markdown',
-        reply_markup=reply_markup
-    )
-
-async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """شروع فرآیند ورود"""
-    await update.message.reply_text(
-        "🔐 *ورود به سیستم*\n\n"
-        "لطفاً نام کاربری خود را وارد کنید:\n\n"
-        "نام کاربری و رمز پیش‌فرض ادمین:\n"
-        "`admin` / `admin123`",
-        parse_mode='Markdown'
-    )
-    return LOGIN_USERNAME
-
-async def login_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دریافت نام کاربری"""
-    context.user_data['login_username'] = update.message.text.strip()
-    await update.message.reply_text("🔑 حالا رمز عبور خود را وارد کنید:")
-    return LOGIN_PASSWORD
-
-async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """بررسی رمز عبور و ورود"""
-    username = context.user_data['login_username']
-    password = update.message.text
-    telegram_id = update.effective_user.id
-    
-    # حذف پیام رمز عبور
-    await update.message.delete()
-    
-    with open(USERS_FILE, 'r', encoding='utf-8') as f:
-        users = json.load(f)
-    
-    if username in users and users[username]['password'] == hash_password(password):
-        # ذخیره telegram_id
-        users[username]['telegram_id'] = telegram_id
-        with open(USERS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(users, f, ensure_ascii=False, indent=2)
+    # پر کردن داده‌ها
+    for row, (user_id, first_name, last_name) in enumerate(users, 2):
+        ws.cell(row=row, column=1, value=f"{first_name} {last_name}").alignment = center_alignment
         
-        # ذخیره session
-        user_sessions[telegram_id] = {
-            'username': username,
-            'is_admin': users[username].get('is_admin', False),
-            'full_name': users[username]['full_name']
-        }
-        
-        await update.message.reply_text(
-            f"✅ خوش آمدید {users[username]['full_name']}!\n\n"
-            "از منوی زیر استفاده کنید:"
+        for col, date_str in enumerate(dates, 2):
+            c.execute('''
+                SELECT m1.name, m2.name
+                FROM reservations r
+                LEFT JOIN meals m1 ON r.meal_id = m1.id
+                LEFT JOIN meals m2 ON r.dessert_id = m2.id
+                WHERE r.user_id = ? AND r.reservation_date = ?
+            ''', (user_id, date_str))
+            
+            result = c.fetchone()
+            if result:
+                meal_name, dessert_name = result
+                cell_value = meal_name
+                if dessert_name:
+                    cell_value += f"\n{dessert_name}"
+                ws.cell(row=row, column=col, value=cell_value).alignment = center_alignment
+    
+    # تنظیم عرض ستون‌ها
+    ws.column_dimensions['A'].width = 20
+    for col in range(2, len(headers) + 1):
+        ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = 15
+    
+    # ذخیره فایل
+    filename = f"food_schedule_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    wb.save(filename)
+    conn.close()
+    
+    # ارسال فایل
+    with open(filename, 'rb') as file:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=file,
+            filename=filename,
+            caption="📊 برنامه غذایی دو هفته آینده"
         )
-        await show_main_menu(update, context)
-        return ConversationHandler.END
-    else:
-        await update.message.reply_text(
-            "❌ نام کاربری یا رمز عبور اشتباه است.\n\n"
-            "دوباره امتحان کنید یا /cancel برای لغو"
-        )
-        return LOGIN_USERNAME
+    
+    os.remove(filename)
+    
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data='back_to_admin')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.message.reply_text("فایل اکسل ارسال شد.", reply_markup=reply_markup)
 
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش منوی اصلی"""
-    telegram_id = update.effective_user.id
+# ارسال پیام همگانی
+async def start_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     
-    if telegram_id not in user_sessions:
-        await start(update, context)
-        return
-    
-    session = user_sessions[telegram_id]
-    
-    if session['is_admin']:
-        keyboard = [
-            [KeyboardButton("➕ افزودن کاربر"), KeyboardButton("👥 لیست کاربران")],
-            [KeyboardButton("🍽️ مدیریت منوی غذایی"), KeyboardButton("✏️ ویرایش غذای کاربران")],
-            [KeyboardButton("🍽️ انتخاب غذاهای من"), KeyboardButton("👁️ مشاهده برنامه")],
-            [KeyboardButton("📋 گزارش تغییرات"), KeyboardButton("🔑 تغییر رمز عبور")],
-            [KeyboardButton("🚪 خروج")]
-        ]
-    else:
-        keyboard = [
-            [KeyboardButton("🍽️ انتخاب غذاهای من")],
-            [KeyboardButton("👁️ مشاهده برنامه")],
-            [KeyboardButton("🔑 تغییر رمز عبور"), KeyboardButton("🚪 خروج")]
-        ]
-    
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    message = f"🏠 *منوی اصلی*\n\n" \
-              f"👤 {session['full_name']}\n" \
-              f"{'👑 مدیر سیستم' if session['is_admin'] else '👤 کاربر'}"
-    
-    if update.message:
-        await update.message.reply_text(message, parse_mode='Markdown', reply_markup=reply_markup)
-    else:
-        await update.callback_query.message.reply_text(message, parse_mode='Markdown', reply_markup=reply_markup)
-
-async def view_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """مشاهده برنامه غذایی"""
-    try:
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        ws = wb.active
-        
-        # Send Excel file directly
-        await update.message.reply_document(
-            document=open(EXCEL_FILE, 'rb'),
-            filename="meal_plan.xlsx",
-            caption="📅 *برنامه غذایی*\n\nفایل اکسل برنامه غذایی را دانلود کنید.",
-            parse_mode='Markdown'
-        )
-        
-        # Also send a text summary
-        message = "📊 *خلاصه برنامه غذایی*\n\n"
-        
-        # Count users
-        user_count = 0
-        for row in range(3, ws.max_row + 1):
-            if ws.cell(row=row, column=1).value:
-                user_count += 1
-        
-        message += f"👥 تعداد افراد: {user_count}\n"
-        message += f"📅 تعداد هفته‌ها: 4\n"
-        message += f"📆 تعداد روزها: 20 (5 روز × 4 هفته)\n\n"
-        
-        # List users
-        message += "👤 *افراد ثبت شده:*\n"
-        for row in range(3, min(ws.max_row + 1, 13)):
-            name = ws.cell(row=row, column=1).value
-            if name:
-                message += f"  • {name}\n"
-        
-        if user_count > 10:
-            message += f"  ... و {user_count - 10} نفر دیگر\n"
-        
-        await update.message.reply_text(message, parse_mode='Markdown')
-        
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در خواندن فایل: {str(e)}")
-
-async def add_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """شروع افزودن کاربر"""
-    telegram_id = update.effective_user.id
-    if telegram_id not in user_sessions or not user_sessions[telegram_id]['is_admin']:
-        await update.message.reply_text("⛔ شما دسترسی ندارید!")
-        return ConversationHandler.END
-    
-    await update.message.reply_text(
-        "➕ *افزودن کاربر جدید*\n\n"
-        "نام کاربری را وارد کنید:\n"
-        "(فقط حروف انگلیسی و اعداد)",
-        parse_mode='Markdown'
-    )
-    return ADD_USER_USERNAME
-
-async def add_user_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دریافت نام کاربری"""
-    username = update.message.text.strip()
-    
-    with open(USERS_FILE, 'r', encoding='utf-8') as f:
-        users = json.load(f)
-    
-    if username in users:
-        await update.message.reply_text("❌ این نام کاربری قبلاً ثبت شده است. دوباره امتحان کنید:")
-        return ADD_USER_USERNAME
-    
-    context.user_data['new_username'] = username
-    await update.message.reply_text("✅ نام و نام خانوادگی را وارد کنید:")
-    return ADD_USER_FULLNAME
-
-async def add_user_fullname(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دریافت نام کامل"""
-    context.user_data['new_fullname'] = update.message.text.strip()
-    await update.message.reply_text("🔑 رمز عبور را وارد کنید (حداقل 4 کاراکتر):")
-    return ADD_USER_PASSWORD
-
-async def add_user_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ذخیره کاربر جدید"""
-    password = update.message.text
-    await update.message.delete()
-    
-    if len(password) < 4:
-        await update.message.reply_text("❌ رمز عبور باید حداقل 4 کاراکتر باشد. دوباره وارد کنید:")
-        return ADD_USER_PASSWORD
-    
-    username = context.user_data['new_username']
-    fullname = context.user_data['new_fullname']
-    
-    with open(USERS_FILE, 'r', encoding='utf-8') as f:
-        users = json.load(f)
-    
-    users[username] = {
-        "password": hash_password(password),
-        "is_admin": False,
-        "full_name": fullname,
-        "telegram_id": None
-    }
-    
-    with open(USERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
-    
-    # افزودن به اکسل
-    wb, ws = unprotect_excel()
-    if wb and ws:
-        row = 3
-        while ws.cell(row=row, column=1).value:
-            row += 1
-        ws.cell(row=row, column=1, value=fullname)
-        wb.save(EXCEL_FILE)
-        protect_excel()
-    
-    await update.message.reply_text(
-        f"✅ کاربر {fullname} با موفقیت اضافه شد!\n\n"
-        f"نام کاربری: `{username}`\n"
-        f"رمز عبور: ||{password}||\n\n"
-        "این اطلاعات را به کاربر بدهید.",
-        parse_mode='Markdown'
+    await query.edit_message_text(
+        "📢 پیام خود را برای ارسال به همه کاربران وارد کنید:\n\n"
+        "برای لغو /cancel را ارسال کنید."
     )
     
-    context.user_data.clear()
+    return BROADCAST_MSG
+
+# ارسال پیام به همه
+async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message.text
+    
+    conn = sqlite3.connect('food_reservation.db')
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE is_active = 1")
+    users = c.fetchall()
+    conn.close()
+    
+    success_count = 0
+    fail_count = 0
+    
+    for (user_id,) in users:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=f"📢 پیام از مدیریت:\n\n{message}")
+            success_count += 1
+        except Exception as e:
+            logger.error(f"Failed to send to {user_id}: {e}")
+            fail_count += 1
+    
+    await update.message.reply_text(
+        f"✅ پیام شما به {success_count} کاربر ارسال شد.\n"
+        f"❌ {fail_count} کاربر دریافت نکردند.\n\n"
+        "برای بازگشت به منو /start را ارسال کنید."
+    )
+    
     return ConversationHandler.END
 
-async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """لیست کاربران"""
-    telegram_id = update.effective_user.id
-    if telegram_id not in user_sessions or not user_sessions[telegram_id]['is_admin']:
-        await update.message.reply_text("⛔ شما دسترسی ندارید!")
-        return
-    
-    with open(USERS_FILE, 'r', encoding='utf-8') as f:
-        users = json.load(f)
-    
-    message = "👥 *لیست کاربران:*\n\n"
-    for username, data in users.items():
-        role = "👑 ادمین" if data.get('is_admin') else "👤 کاربر"
-        status = "🟢 متصل" if data.get('telegram_id') else "⚪ هنوز وارد نشده"
-        message += f"{role} {data['full_name']}\n"
-        message += f"   نام کاربری: `{username}`\n"
-        message += f"   وضعیت: {status}\n\n"
-    
-    await update.message.reply_text(message, parse_mode='Markdown')
-
-async def manage_menu_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """شروع مدیریت منو"""
-    telegram_id = update.effective_user.id
-    if telegram_id not in user_sessions or not user_sessions[telegram_id]['is_admin']:
-        await update.message.reply_text("⛔ شما دسترسی ندارید!")
-        return ConversationHandler.END
-    
-    keyboard = [
-        [InlineKeyboardButton("هفته 1", callback_data="menu_week_1")],
-        [InlineKeyboardButton("هفته 2", callback_data="menu_week_2")],
-        [InlineKeyboardButton("هفته 3", callback_data="menu_week_3")],
-        [InlineKeyboardButton("هفته 4", callback_data="menu_week_4")],
-        [InlineKeyboardButton("❌ انصراف", callback_data="menu_cancel")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "🍽️ *مدیریت منوی غذایی*\n\n"
-        "کدام هفته را میخواهید مدیریت کنید؟",
-        parse_mode='Markdown',
-        reply_markup=reply_markup
-    )
-    return SELECT_WEEK
-
-async def menu_select_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """انتخاب هفته"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "menu_cancel":
-        await query.edit_message_text("❌ لغو شد.")
-        return ConversationHandler.END
-    
-    week = query.data.split('_')[2]
-    context.user_data['selected_week'] = week
-    
-    keyboard = [
-        [InlineKeyboardButton("شنبه", callback_data="menu_day_1")],
-        [InlineKeyboardButton("یکشنبه", callback_data="menu_day_2")],
-        [InlineKeyboardButton("دوشنبه", callback_data="menu_day_3")],
-        [InlineKeyboardButton("سه‌شنبه", callback_data="menu_day_4")],
-        [InlineKeyboardButton("چهارشنبه", callback_data="menu_day_5")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="menu_back")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        f"📅 هفته {week}\n\n"
-        "کدام روز را میخواهید مدیریت کنید؟",
-        reply_markup=reply_markup
-    )
-    return SELECT_DAY
-
-async def menu_select_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش منوی روز و امکان ویرایش"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "menu_back":
-        return await manage_menu_start(update, context)
-    
-    day = query.data.split('_')[2]
-    week = context.user_data['selected_week']
-    context.user_data['selected_day'] = day
-    
-    with open(MENU_FILE, 'r', encoding='utf-8') as f:
-        menu_data = json.load(f)
-    
-    day_menu = menu_data[f'week_{week}'][f'day_{day}']
-    
-    days_name = {1: "شنبه", 2: "یکشنبه", 3: "دوشنبه", 4: "سه‌شنبه", 5: "چهارشنبه"}
-    
-    message = f"📅 *هفته {week} - {days_name[int(day)]}*\n\n"
-    message += "🍽️ *غذاها:*\n"
-    if day_menu['meals']:
-        for meal in day_menu['meals']:
-            message += f"  • {meal}\n"
-    else:
-        message += "  هیچ غذایی تعریف نشده\n"
-    
-    message += "\n🍰 *دسرها:*\n"
-    if day_menu['desserts']:
-        for dessert in day_menu['desserts']:
-            message += f"  • {dessert}\n"
-    else:
-        message += "  هیچ دسری تعریف نشده\n"
-    
-    message += "\n➕ برای افزودن، نام غذا یا دسر را بفرستید:\n"
-    message += "`غذا: نام_غذا`\n"
-    message += "`دسر: نام_دسر`\n\n"
-    message += "یا از دکمه‌های زیر استفاده کنید:"
-    
-    keyboard = [
-        [InlineKeyboardButton("🗑️ پاک کردن غذا", callback_data=f"delete_meal_{week}_{day}")],
-        [InlineKeyboardButton("🗑️ پاک کردن دسر", callback_data=f"delete_dessert_{week}_{day}")],
-        [InlineKeyboardButton("✅ اتمام", callback_data="menu_done")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(message, parse_mode='Markdown', reply_markup=reply_markup)
-    return SELECT_DAY
-
-async def handle_menu_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دریافت پیام برای افزودن غذا/دسر"""
-    telegram_id = update.effective_user.id
-    if telegram_id not in user_sessions or not user_sessions[telegram_id]['is_admin']:
-        return
-    
-    text = update.message.text.strip()
-    
-    if not text.startswith(('غذا:', 'دسر:')):
-        return
-    
-    if 'selected_week' not in context.user_data or 'selected_day' not in context.user_data:
-        await update.message.reply_text("❌ لطفاً ابتدا روز را از منو انتخاب کنید.")
-        return
-    
-    week = context.user_data['selected_week']
-    day = context.user_data['selected_day']
-    
-    with open(MENU_FILE, 'r', encoding='utf-8') as f:
-        menu_data = json.load(f)
-    
-    if text.startswith('غذا:'):
-        item_name = text.replace('غذا:', '').strip()
-        menu_data[f'week_{week}'][f'day_{day}']['meals'].append(item_name)
-        item_type = "غذا"
-    else:
-        item_name = text.replace('دسر:', '').strip()
-        menu_data[f'week_{week}'][f'day_{day}']['desserts'].append(item_name)
-        item_type = "دسر"
-    
-    with open(MENU_FILE, 'w', encoding='utf-8') as f:
-        json.dump(menu_data, f, ensure_ascii=False, indent=2)
-    
-    await update.message.reply_text(f"✅ {item_type} «{item_name}» اضافه شد!")
-
-async def delete_menu_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """حذف غذا یا دسر"""
-    query = update.callback_query
-    await query.answer()
-    
-    parts = query.data.split('_')
-    item_type = parts[1]  # meal or dessert
-    week = parts[2]
-    day = parts[3]
-    
-    with open(MENU_FILE, 'r', encoding='utf-8') as f:
-        menu_data = json.load(f)
-    
-    items = menu_data[f'week_{week}'][f'day_{day}']['meals' if item_type == 'meal' else 'desserts']
-    
-    if not items:
-        await query.answer("❌ هیچ موردی برای حذف وجود ندارد!", show_alert=True)
-        return SELECT_DAY
-    
-    keyboard = []
-    for idx, item in enumerate(items):
-        keyboard.append([InlineKeyboardButton(f"🗑️ {item}", callback_data=f"confirm_delete_{item_type}_{week}_{day}_{idx}")])
-    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"menu_day_{day}")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        f"کدام مورد را میخواهید حذف کنید؟",
-        reply_markup=reply_markup
-    )
-    return SELECT_DAY
-
-async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تأیید حذف"""
-    query = update.callback_query
-    await query.answer()
-    
-    parts = query.data.split('_')
-    item_type = parts[2]
-    week = parts[3]
-    day = parts[4]
-    idx = int(parts[5])
-    
-    with open(MENU_FILE, 'r', encoding='utf-8') as f:
-        menu_data = json.load(f)
-    
-    key = 'meals' if item_type == 'meal' else 'desserts'
-    deleted_item = menu_data[f'week_{week}'][f'day_{day}'][key].pop(idx)
-    
-    with open(MENU_FILE, 'w', encoding='utf-8') as f:
-        json.dump(menu_data, f, ensure_ascii=False, indent=2)
-    
-    await query.answer(f"✅ {deleted_item} حذف شد!", show_alert=True)
-    
-    # بازگشت به منوی روز
-    context.user_data['selected_week'] = week
-    context.user_data['selected_day'] = day
-    
-    # ساختن query جدید
-    query.data = f"menu_day_{day}"
-    await menu_select_day(update, context)
-    return SELECT_DAY
-
-async def edit_user_meals_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """شروع ویرایش غذای کاربران توسط ادمین"""
-    telegram_id = update.effective_user.id
-    if telegram_id not in user_sessions or not user_sessions[telegram_id]['is_admin']:
-        await update.message.reply_text("⛔ شما دسترسی ندارید!")
-        return ConversationHandler.END
-    
-    with open(USERS_FILE, 'r', encoding='utf-8') as f:
-        users = json.load(f)
-    
-    keyboard = []
-    for username, data in users.items():
-        if not data.get('is_admin'):
-            keyboard.append([InlineKeyboardButton(
-                data['full_name'], 
-                callback_data=f"edituser_{username}"
-            )])
-    
-    keyboard.append([InlineKeyboardButton("❌ انصراف", callback_data="edituser_cancel")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "✏️ *ویرایش غذای کاربران*\n\n"
-        "کاربر مورد نظر را انتخاب کنید:",
-        parse_mode='Markdown',
-        reply_markup=reply_markup
-    )
-    return EDIT_USER_SELECT
-
-async def edit_user_select_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """انتخاب کاربر برای ویرایش"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "edituser_cancel":
-        await query.edit_message_text("❌ لغو شد.")
-        return ConversationHandler.END
-    
-    username = query.data.split('_')[1]
-    context.user_data['edit_username'] = username
-    
-    with open(USERS_FILE, 'r', encoding='utf-8') as f:
-        users = json.load(f)
-    full_name = users[username]['full_name']
-    
-    keyboard = [
-        [InlineKeyboardButton("هفته 1", callback_data="edituser_week_1")],
-        [InlineKeyboardButton("هفته 2", callback_data="edituser_week_2")],
-        [InlineKeyboardButton("هفته 3", callback_data="edituser_week_3")],
-        [InlineKeyboardButton("هفته 4", callback_data="edituser_week_4")],
-        [InlineKeyboardButton("❌ انصراف", callback_data="edituser_cancel")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        f"✏️ ویرایش غذای *{full_name}*\n\n"
-        "کدام هفته را میخواهید ویرایش کنید؟",
-        parse_mode='Markdown',
-        reply_markup=reply_markup
-    )
-    return EDIT_USER_WEEK
-
-async def edit_user_select_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """انتخاب هفته برای ویرایش غذای کاربر"""
-    query = update.callback_query
-    await query.answer()
-    
-    week = query.data.split('_')[2]
-    context.user_data['edit_week'] = week
-    
-    # Ensure username is set (for regular users editing their own meals)
-    telegram_id = update.effective_user.id
-    if telegram_id in user_sessions and 'edit_username' not in context.user_data:
-        context.user_data['edit_username'] = user_sessions[telegram_id]['username']
-    
-    keyboard = [
-        [InlineKeyboardButton("شنبه", callback_data="edituser_day_1")],
-        [InlineKeyboardButton("یکشنبه", callback_data="edituser_day_2")],
-        [InlineKeyboardButton("دوشنبه", callback_data="edituser_day_3")],
-        [InlineKeyboardButton("سه‌شنبه", callback_data="edituser_day_4")],
-        [InlineKeyboardButton("چهارشنبه", callback_data="edituser_day_5")],
-        [InlineKeyboardButton("✅ اتمام", callback_data="edituser_done")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        f"📅 هفته {week}\n\n"
-        "کدام روز را میخواهید ویرایش کنید؟",
-        reply_markup=reply_markup
-    )
-    return EDIT_USER_DAY
-
-async def edit_user_select_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """انتخاب و ویرایش غذا/دسر روز خاص برای کاربر"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "edituser_done":
-        await query.edit_message_text("✅ ویرایش تمام شد!")
-        return ConversationHandler.END
-    
-    day = query.data.split('_')[2]
-    week = context.user_data.get('edit_week')
-    username = context.user_data.get('edit_username')
-    
-    # Safety check: Ensure username exists
-    telegram_id = update.effective_user.id
-    if not username and telegram_id in user_sessions:
-        username = user_sessions[telegram_id]['username']
-        context.user_data['edit_username'] = username
-    
-    if not username:
-        await query.answer("❌ خطا: نام کاربری یافت نشد. لطفاً دوباره وارد شوید.", show_alert=True)
-        return ConversationHandler.END
-    
-    if not week:
-        await query.answer("❌ خطا: هفته انتخاب نشده است.", show_alert=True)
-        return ConversationHandler.END
-    
-    context.user_data['edit_day'] = day
-    
-    # خواندن منوی این روز
-    with open(MENU_FILE, 'r', encoding='utf-8') as f:
-        menu_data = json.load(f)
-    
-    day_menu = menu_data[f'week_{week}'][f'day_{day}']
-    
-    if not day_menu['meals'] and not day_menu['desserts']:
-        await query.answer("❌ منوی این روز تعریف نشده است!", show_alert=True)
-        return EDIT_USER_DAY
-    
-    # خواندن انتخاب فعلی کاربر
-    with open(USERS_FILE, 'r', encoding='utf-8') as f:
-        users = json.load(f)
-    full_name = users[username]['full_name']
-    
-    wb, ws = unprotect_excel()
-    if not wb or not ws:
-        await query.answer("❌ خطا در باز کردن فایل!", show_alert=True)
-        protect_excel()
-        return EDIT_USER_DAY
-    
-    user_row = None
-    for row in range(3, ws.max_row + 2):
-        if ws.cell(row=row, column=1).value == full_name:
-            user_row = row
-            break
-    
-    # If user not found in Excel, add them
-    if not user_row:
-        user_row = ws.max_row + 1
-        ws.cell(row=user_row, column=1, value=full_name)
-        wb.save(EXCEL_FILE)
-    
-    # محاسبه ستون
-    day_idx = int(day) - 1
-    week_idx = int(week) - 1
-    col = 2 + (week_idx * 10) + (day_idx * 2)
-    
-    current_meal = ws.cell(row=user_row, column=col).value or "-"
-    current_dessert = ws.cell(row=user_row, column=col+1).value or "-"
-    
-    # Lock Excel back
-    protect_excel()
-    
-    days_name = {1: "شنبه", 2: "یکشنبه", 3: "دوشنبه", 4: "سه‌شنبه", 5: "چهارشنبه"}
-    
-    message = f"✏️ *ویرایش غذای {full_name}*\n"
-    message += f"📅 هفته {week} - {days_name[int(day)]}\n\n"
-    message += f"🍽️ غذای فعلی: {current_meal}\n"
-    message += f"🍰 دسر فعلی: {current_dessert}\n\n"
-    message += "غذا یا دسر جدید را انتخاب کنید:"
-    
-    keyboard = []
-    
-    # غذاها
-    if day_menu['meals']:
-        keyboard.append([InlineKeyboardButton("── 🍽️ غذاها ──", callback_data="ignore")])
-        for meal in day_menu['meals']:
-            keyboard.append([InlineKeyboardButton(
-                f"{'✓ ' if meal == current_meal else ''}{meal}",
-                callback_data=f"setmeal_{week}_{day}_{meal}"
-            )])
-    
-    # دسرها
-    if day_menu['desserts']:
-        keyboard.append([InlineKeyboardButton("── 🍰 دسرها ──", callback_data="ignore")])
-        for dessert in day_menu['desserts']:
-            keyboard.append([InlineKeyboardButton(
-                f"{'✓ ' if dessert == current_dessert else ''}{dessert}",
-                callback_data=f"setdessert_{week}_{day}_{dessert}"
-            )])
-    
-    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"edituser_week_{week}")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(message, parse_mode='Markdown', reply_markup=reply_markup)
-    return EDIT_USER_DAY
-
-async def set_user_meal_dessert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تنظیم غذا یا دسر کاربر"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "ignore":
-        return EDIT_USER_DAY
-    
-    parts = query.data.split('_')
-    item_type = parts[0]  # setmeal or setdessert
-    week = parts[1]
-    day = parts[2]
-    item_value = '_'.join(parts[3:])
-    
-    username = context.user_data.get('edit_username')
-    
-    # Safety check: Ensure username exists
-    telegram_id = update.effective_user.id
-    if not username and telegram_id in user_sessions:
-        username = user_sessions[telegram_id]['username']
-        context.user_data['edit_username'] = username
-    
-    if not username:
-        await query.answer("❌ خطا: نام کاربری یافت نشد. لطفاً دوباره وارد شوید.", show_alert=True)
-        return ConversationHandler.END
-    
-    with open(USERS_FILE, 'r', encoding='utf-8') as f:
-        users = json.load(f)
-    full_name = users[username]['full_name']
-    
-    # باز کردن قفل و ویرایش
-    wb, ws = unprotect_excel()
-    if not wb or not ws:
-        await query.answer("❌ خطا در باز کردن فایل!", show_alert=True)
-        return EDIT_USER_DAY
-    
-    user_row = None
-    for row in range(3, ws.max_row + 2):
-        if ws.cell(row=row, column=1).value == full_name:
-            user_row = row
-            break
-    
-    day_idx = int(day) - 1
-    week_idx = int(week) - 1
-    col = 2 + (week_idx * 10) + (day_idx * 2)
-    
-    if item_type == "setmeal":
-        ws.cell(row=user_row, column=col, value=item_value)
-    else:  # setdessert
-        ws.cell(row=user_row, column=col+1, value=item_value)
-    
-    wb.save(EXCEL_FILE)
-    protect_excel()
-    
-    # ثبت در لاگ
-    if telegram_id in user_sessions:
-        if user_sessions[telegram_id]['is_admin']:
-            admin_name = user_sessions[telegram_id]['full_name']
-            log_change(f"{admin_name} (ویرایش برای {full_name})")
-        else:
-            log_change(full_name)
-    else:
-        log_change(full_name)
-    
-    await query.answer(f"✅ {'غذا' if item_type == 'setmeal' else 'دسر'} ذخیره شد!", show_alert=True)
-    
-    # بازگشت به همان روز
-    context.user_data['edit_week'] = week
-    query.data = f"edituser_day_{day}"
-    await edit_user_select_day(update, context)
-    return EDIT_USER_DAY
-
-async def my_meals_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """شروع انتخاب غذای خود کاربر"""
-    telegram_id = update.effective_user.id
-    if telegram_id not in user_sessions:
-        await update.message.reply_text("⛔ لطفاً ابتدا وارد شوید!")
-        return ConversationHandler.END
-    
-    # IMPORTANT: Set username for editing
-    context.user_data['edit_username'] = user_sessions[telegram_id]['username']
-    
-    keyboard = [
-        [InlineKeyboardButton("هفته 1", callback_data="edituser_week_1")],
-        [InlineKeyboardButton("هفته 2", callback_data="edituser_week_2")],
-        [InlineKeyboardButton("هفته 3", callback_data="edituser_week_3")],
-        [InlineKeyboardButton("هفته 4", callback_data="edituser_week_4")],
-        [InlineKeyboardButton("❌ انصراف", callback_data="edituser_cancel")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "🍽️ *انتخاب غذاهای من*\n\n"
-        "کدام هفته را میخواهید ویرایش کنید؟",
-        parse_mode='Markdown',
-        reply_markup=reply_markup
-    )
-    return EDIT_USER_WEEK
-
-async def change_password_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """شروع تغییر رمز عبور"""
-    telegram_id = update.effective_user.id
-    if telegram_id not in user_sessions:
-        await update.message.reply_text("⛔ لطفاً ابتدا وارد شوید!")
-        return ConversationHandler.END
-    
-    await update.message.reply_text(
-        "🔑 *تغییر رمز عبور*\n\n"
-        "رمز عبور فعلی خود را وارد کنید:",
-        parse_mode='Markdown'
-    )
-    return CHANGE_PASSWORD_CURRENT
-
-async def change_password_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """بررسی رمز فعلی"""
-    telegram_id = update.effective_user.id
-    current_password = update.message.text
-    
-    await update.message.delete()
-    
-    username = user_sessions[telegram_id]['username']
-    
-    with open(USERS_FILE, 'r', encoding='utf-8') as f:
-        users = json.load(f)
-    
-    if users[username]['password'] != hash_password(current_password):
-        await update.message.reply_text("❌ رمز عبور فعلی اشتباه است. دوباره امتحان کنید:")
-        return CHANGE_PASSWORD_CURRENT
-    
-    await update.message.reply_text("✅ رمز عبور جدید را وارد کنید (حداقل 4 کاراکتر):")
-    return CHANGE_PASSWORD_NEW
-
-async def change_password_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دریافت رمز جدید"""
-    new_password = update.message.text
-    await update.message.delete()
-    
-    if len(new_password) < 4:
-        await update.message.reply_text("❌ رمز عبور باید حداقل 4 کاراکتر باشد. دوباره وارد کنید:")
-        return CHANGE_PASSWORD_NEW
-    
-    context.user_data['new_password'] = new_password
-    await update.message.reply_text("🔁 رمز عبور جدید را دوباره وارد کنید:")
-    return CHANGE_PASSWORD_CONFIRM
-
-async def change_password_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تأیید و ذخیره رمز جدید"""
-    confirm_password = update.message.text
-    await update.message.delete()
-    
-    if confirm_password != context.user_data['new_password']:
-        await update.message.reply_text("❌ رمزهای عبور مطابقت ندارند. دوباره رمز جدید را وارد کنید:")
-        return CHANGE_PASSWORD_NEW
-    
-    telegram_id = update.effective_user.id
-    username = user_sessions[telegram_id]['username']
-    
-    with open(USERS_FILE, 'r', encoding='utf-8') as f:
-        users = json.load(f)
-    
-    users[username]['password'] = hash_password(confirm_password)
-    
-    with open(USERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
-    
-    await update.message.reply_text("✅ رمز عبور با موفقیت تغییر کرد!")
-    
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def download_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دانلود فایل اکسل (فقط ادمین)"""
-    telegram_id = update.effective_user.id
-    if telegram_id not in user_sessions or not user_sessions[telegram_id]['is_admin']:
-        await update.message.reply_text("⛔ شما دسترسی ندارید!")
-        return
-    
-    try:
-        with open(EXCEL_FILE, 'rb') as f:
-            await update.message.reply_document(
-                document=f,
-                filename="meal_plan.xlsx",
-                caption="📥 *فایل اکسل برنامه غذایی*\n\nفایل قفل شده است.",
-                parse_mode='Markdown'
-            )
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا: {str(e)}")
-    """مشاهده گزارش تغییرات"""
-    telegram_id = update.effective_user.id
-    if telegram_id not in user_sessions or not user_sessions[telegram_id]['is_admin']:
-        await update.message.reply_text("⛔ شما دسترسی ندارید!")
-        return
-    
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, 'r', encoding='utf-8') as f:
-            log_content = f.read()
-        
-        # ارسال به صورت فایل اگر طولانی است
-        if len(log_content) > 3000:
-            with open(LOG_FILE, 'rb') as f:
-                await update.message.reply_document(
-                    document=f,
-                    filename="change_log.txt",
-                    caption="📋 گزارش تغییرات"
-                )
-        else:
-            await update.message.reply_text(f"📋 *گزارش تغییرات:*\n\n```\n{log_content}\n```", parse_mode='Markdown')
-    else:
-        await update.message.reply_text("❌ فایل لاگ یافت نشد!")
-
-async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """خروج از سیستم"""
-    telegram_id = update.effective_user.id
-    if telegram_id in user_sessions:
-        del user_sessions[telegram_id]
-    
-    await update.message.reply_text("👋 با موفقیت خارج شدید!")
-    await start(update, context)
-
+# لغو عملیات
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """لغو عملیات"""
-    await update.message.reply_text("❌ عملیات لغو شد.")
-    context.user_data.clear()
+    await update.message.reply_text(
+        "عملیات لغو شد.\n\n"
+        "برای بازگشت به منو /start را ارسال کنید."
+    )
     return ConversationHandler.END
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """مدیریت پیام‌های متنی"""
-    text = update.message.text
+# هندلر callback query
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
     
-    if text == "🔐 ورود به سیستم":
-        return await login_start(update, context)
-    elif text == "👁️ مشاهده برنامه غذایی":
-        return await view_schedule(update, context)
-    elif text == "➕ افزودن کاربر":
-        return await add_user_start(update, context)
-    elif text == "👥 لیست کاربران":
-        return await list_users(update, context)
-    elif text == "🍽️ مدیریت منوی غذایی":
-        return await manage_menu_start(update, context)
-    elif text == "✏️ ویرایش غذای کاربران":
-        return await edit_user_meals_start(update, context)
-    elif text == "🍽️ انتخاب غذاهای من":
-        return await my_meals_start(update, context)
-    elif text == "📋 گزارش تغییرات":
-        return await view_log(update, context)
-    elif text == "🔑 تغییر رمز عبور":
-        return await change_password_start(update, context)
-    elif text == "🚪 خروج":
-        return await logout(update, context)
-    elif text.startswith(('غذا:', 'دسر:')):
-        return await handle_menu_message(update, context)
+    if not is_admin(update.effective_user.id) and not is_authorized_user(update.effective_user.id):
+        await query.answer("شما دسترسی ندارید.", show_alert=True)
+        return
+    
+    data = query.data
+    
+    # مسیریابی
+    if data == 'back_to_admin':
+        await admin_menu(update, context)
+    elif data == 'back_to_main':
+        await query.answer()
+        keyboard = [
+            [InlineKeyboardButton("🍽 رزرو غذا", callback_data='reserve_food')],
+            [InlineKeyboardButton("📋 رزروهای من", callback_data='my_reservations')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("منوی اصلی:", reply_markup=reply_markup)
+    elif data == 'admin_users':
+        await admin_users_menu(update, context)
+    elif data == 'admin_meals':
+        await admin_meals_menu(update, context)
+    elif data == 'list_users':
+        await list_users(update, context)
+    elif data == 'list_meals':
+        await list_meals(update, context)
+    elif data == 'add_meal':
+        await select_day_for_meal(update, context)
+    elif data == 'add_dessert':
+        await select_day_for_dessert(update, context)
+    elif data.startswith('day_meal_'):
+        await receive_meal_day(update, context)
+    elif data.startswith('day_dessert_'):
+        await receive_meal_day(update, context)
+    elif data == 'admin_view_reservations':
+        await admin_view_reservations(update, context)
+    elif data == 'admin_export_excel':
+        await export_to_excel(update, context)
+    elif data == 'reserve_food':
+        await reserve_food_menu(update, context)
+    elif data.startswith('reserve_'):
+        await select_meal_for_reservation(update, context)
+    elif data.startswith('meal_'):
+        await select_dessert_for_reservation(update, context)
+    elif data.startswith('dessert_'):
+        await complete_reservation(update, context)
+    elif data == 'my_reservations':
+        await my_reservations(update, context)
 
 def main():
-    """راه‌اندازی ربات"""
-    initialize_files()
+    # دریافت توکن از متغیر محیطی
+    TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+    PORT = int(os.getenv('PORT', 8443))
     
-    # توکن ربات را اینجا قرار دهید
-    TOKEN = "YOUR_BOT_TOKEN_HERE"
+    if not TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not found!")
+        return
     
+    # ایجاد دیتابیس
+    init_db()
+    
+    # ایجاد Application
     application = Application.builder().token(TOKEN).build()
     
-    # Handler ورود
-    login_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🔐 ورود به سیستم$"), login_start)],
-        states={
-            LOGIN_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_username)],
-            LOGIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
-    )
-    
-    # Handler افزودن کاربر
+    # ConversationHandler برای افزودن کاربر
     add_user_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^➕ افزودن کاربر$"), add_user_start)],
+        entry_points=[CallbackQueryHandler(start_add_user, pattern='^add_user$')],
         states={
-            ADD_USER_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_user_username)],
-            ADD_USER_FULLNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_user_fullname)],
-            ADD_USER_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_user_password)],
+            ADD_USER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_user_id)],
+            ADD_USER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_user_name)],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
     )
     
-    # Handler مدیریت منو
-    menu_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🍽️ مدیریت منوی غذایی$"), manage_menu_start)],
-        states={
-            SELECT_WEEK: [CallbackQueryHandler(menu_select_week, pattern="^menu_week_")],
-            SELECT_DAY: [
-                CallbackQueryHandler(menu_select_day, pattern="^menu_day_"),
-                CallbackQueryHandler(delete_menu_item, pattern="^delete_(meal|dessert)_"),
-                CallbackQueryHandler(confirm_delete, pattern="^confirm_delete_"),
-                CallbackQueryHandler(lambda u, c: ConversationHandler.END, pattern="^menu_done$"),
-            ],
-        },
-        fallbacks=[
-            CommandHandler('cancel', cancel),
-            CallbackQueryHandler(lambda u, c: ConversationHandler.END, pattern="^menu_cancel$")
+    # ConversationHandler برای افزودن غذا
+    add_meal_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(receive_meal_day, pattern='^day_meal_'),
+            CallbackQueryHandler(receive_meal_day, pattern='^day_dessert_')
         ],
+        states={
+            ADD_MEAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_meal)],
+            ADD_DESSERT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_meal)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
     )
     
-    # Handler ویرایش غذای کاربران توسط ادمین
-    edit_user_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^✏️ ویرایش غذای کاربران$"), edit_user_meals_start)],
+    # ConversationHandler برای پیام همگانی
+    broadcast_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_broadcast, pattern='^admin_broadcast$')],
         states={
-            EDIT_USER_SELECT: [CallbackQueryHandler(edit_user_select_user, pattern="^edituser_")],
-            EDIT_USER_WEEK: [
-                CallbackQueryHandler(edit_user_select_week, pattern="^edituser_week_"),
-                CallbackQueryHandler(lambda u, c: ConversationHandler.END, pattern="^edituser_cancel$")
-            ],
-            EDIT_USER_DAY: [
-                CallbackQueryHandler(edit_user_select_day, pattern="^edituser_day_"),
-                CallbackQueryHandler(edit_user_select_week, pattern="^edituser_week_"),  # Back button
-                CallbackQueryHandler(set_user_meal_dessert, pattern="^(setmeal|setdessert)_"),
-                CallbackQueryHandler(lambda u, c: ConversationHandler.END, pattern="^edituser_done$"),
-            ],
-        },
-        fallbacks=[
-            CommandHandler('cancel', cancel),
-            CallbackQueryHandler(lambda u, c: ConversationHandler.END, pattern="^edituser_cancel$")
-        ],
-    )
-    
-    # Handler انتخاب غذای خودم
-    my_meals_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🍽️ انتخاب غذاهای من$"), my_meals_start)],
-        states={
-            EDIT_USER_WEEK: [
-                CallbackQueryHandler(edit_user_select_week, pattern="^edituser_week_"),
-                CallbackQueryHandler(lambda u, c: ConversationHandler.END, pattern="^edituser_cancel$")
-            ],
-            EDIT_USER_DAY: [
-                CallbackQueryHandler(edit_user_select_day, pattern="^edituser_day_"),
-                CallbackQueryHandler(edit_user_select_week, pattern="^edituser_week_"),  # Back button
-                CallbackQueryHandler(set_user_meal_dessert, pattern="^(setmeal|setdessert)_"),
-                CallbackQueryHandler(lambda u, c: ConversationHandler.END, pattern="^edituser_done$"),
-            ],
-        },
-        fallbacks=[
-            CommandHandler('cancel', cancel),
-            CallbackQueryHandler(lambda u, c: ConversationHandler.END, pattern="^edituser_cancel$")
-        ],
-    )
-    
-    # Handler تغییر رمز
-    change_pass_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🔑 تغییر رمز عبور$"), change_password_start)],
-        states={
-            CHANGE_PASSWORD_CURRENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, change_password_current)],
-            CHANGE_PASSWORD_NEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, change_password_new)],
-            CHANGE_PASSWORD_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, change_password_confirm)],
+            BROADCAST_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, send_broadcast)],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
     )
     
     # اضافه کردن handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("download", download_excel))
-    application.add_handler(login_handler)
     application.add_handler(add_user_handler)
-    application.add_handler(menu_handler)
-    application.add_handler(edit_user_handler)
-    application.add_handler(my_meals_handler)
-    application.add_handler(change_pass_handler)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    application.add_handler(MessageHandler(filters.Regex("^(غذا:|دسر:)"), handle_menu_message))
+    application.add_handler(add_meal_handler)
+    application.add_handler(broadcast_handler)
+    application.add_handler(CallbackQueryHandler(button_handler))
     
-    # شروع ربات
-    print("🤖 ربات در حال اجرا است...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # راه‌اندازی
+    if os.getenv('RAILWAY_ENVIRONMENT'):
+        # حالت webhook برای Railway
+        WEBHOOK_URL = os.getenv('RAILWAY_PUBLIC_DOMAIN')
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TOKEN,
+            webhook_url=f"https://{WEBHOOK_URL}/{TOKEN}"
+        )
+    else:
+        # حالت polling برای تست محلی
+        application.run_polling()
 
 if __name__ == '__main__':
     main()
